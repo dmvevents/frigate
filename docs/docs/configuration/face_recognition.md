@@ -141,6 +141,30 @@ face_recognition:
 </TabItem>
 </ConfigTabs>
 
+### Small Faces From The Recording Stream
+
+Face recognition runs on the `detect` stream, and on a low resolution `detect` stream a face can be only a dozen pixels tall. The embedding models cannot recover detail that was never captured. If the camera's `record` stream is higher resolution, Frigate can optionally go back to the recording for small faces:
+
+```yaml
+face_recognition:
+  enabled: true
+  hires_from_record: true
+  min_face_px_for_detect_crop: 80
+```
+
+- **hires_from_record**: When the face found on the `detect` stream is smaller than `min_face_px_for_detect_crop` (shorter side, in `detect` pixels), Frigate waits for the recording segment that contains the frame, decodes that single frame from the `record` stream with ffmpeg, finds the face again inside the person's bounding box at full resolution and recognizes that crop instead.
+  - Default: `False`
+- **min_face_px_for_detect_crop**: Faces at least this large on the `detect` stream are recognized directly from the `detect` frame as usual.
+  - Default: `80`
+
+Things to know before enabling this:
+
+- Recordings are written in segments (10 seconds by default), so the result arrives seconds after the person was seen. The recognized name is still applied to the tracked object and its event, but notifications sent while the person is in view will not include it. Faces larger than `min_face_px_for_detect_crop` continue to be recognized immediately.
+- The `detect` and `record` streams are not guaranteed to be in sync. Frigate looks for the face inside a padded copy of the person's box rather than at the exact scaled coordinates, and falls back to the `detect` crop when no face is found there, but a large offset between the two streams will reduce how often the recording frame is usable.
+- Each face costs one short ffmpeg decode of the recording segment on the Frigate host. At most three faces per tracked person are fetched this way. The decode uses the camera's hardware acceleration settings when they are configured and falls back to software decoding when that fails.
+- Cameras that do not record, or whose `record` stream is not larger than the `detect` stream, keep using the `detect` crop.
+- Resolution helps when the face was simply too small; it does not fix motion blur or heavy compression on the `record` stream.
+
 ## Usage
 
 Follow these steps to begin:
@@ -233,7 +257,7 @@ Once front-facing images are performing well, start choosing slightly off-angle 
 Start with the [Usage](#usage) section and re-read the [Model Requirements](#model-requirements) above.
 
 1. Enable debug logs to see exactly what Frigate is doing.
-   - Enable debug logs for face recognition by adding `frigate.data_processing.real_time.face: debug` to your `logger` configuration. Restart Frigate after this change.
+   - Enable debug logs for face recognition by adding `frigate.data_processing.real_time.face: debug` to your `logger` configuration (and `frigate.data_processing.common.face.hires: debug` when using `hires_from_record`). Restart Frigate after this change.
 
      ```yaml
      logger:
@@ -264,11 +288,13 @@ Start with the [Usage](#usage) section and re-read the [Model Requirements](#mod
 
 <FaqItem id="does-face-recognition-run-on-the-recording-stream" question="Does face recognition run on the recording stream?">
 
-Face recognition does not run on the recording stream, this would be suboptimal for many reasons:
+By default, no. Face recognition runs on the `detect` stream, and for most setups that is the right place for it:
 
 1. The latency of accessing the recordings means the notifications would not include the names of recognized people because recognition would not complete until after.
 2. The embedding models used run on a set image size, so larger images will be scaled down to match this anyway.
 3. Motion clarity is much more important than extra pixels, over-compression and motion blur are much more detrimental to results than resolution.
+
+If your `detect` stream is low resolution and faces come out smaller than the models can use, first consider raising the `detect` resolution. If that is not an option, `hires_from_record` can recognize only the small faces from the recording stream, with the latency described in [Small Faces From The Recording Stream](#small-faces-from-the-recording-stream).
 
 </FaqItem>
 

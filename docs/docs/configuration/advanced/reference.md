@@ -763,6 +763,12 @@ face_recognition:
   # Optional: Target a specific device to run the model (default: shown below)
   # NOTE: See https://onnxruntime.ai/docs/execution-providers/ for more information
   device: None
+  # Optional: Recognize small faces from the camera's recording stream instead of the detect stream (default: shown below)
+  # NOTE: Waits for the recording segment, decodes one frame per face with ffmpeg and adds latency. See the face recognition docs.
+  hires_from_record: False
+  # Optional: Faces at least this many pixels (shorter side) on the detect stream are recognized from the detect frame (default: shown below)
+  # NOTE: Smaller faces use the recording stream when hires_from_record is enabled
+  min_face_px_for_detect_crop: 80
 
 # Optional: Configuration for license plate recognition capability
 # NOTE: enabled, min_area, and enhancement can be overridden at the camera level

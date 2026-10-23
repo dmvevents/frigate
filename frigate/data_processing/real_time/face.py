@@ -20,6 +20,13 @@ from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.const import FACE_DIR
 from frigate.data_processing.common.face.detector import FaceDetector
+from frigate.data_processing.common.face.hires import (
+    HiResFaceFetcher,
+    HiResOutcome,
+    box_center_within,
+    camera_records_main_stream,
+    hwaccel_args_for,
+)
 from frigate.data_processing.common.face.recognizer import (
     ArcFaceRecognizer,
     FaceNetRecognizer,
@@ -55,6 +62,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.sub_label_publisher = sub_label_publisher
         self.requires_face_detection = "face" not in self.config.objects.all_objects
         self.person_face_history: dict[str, list[tuple[str, float, int]]] = {}
+        self.pending_expirations: dict[str, str] = {}
+        self.hires_skipped_cameras: set[str] = set()
         self.camera_current_people: dict[str, list[str]] = {}
         self.recognizer: FaceRecognizer
         self.faces_per_second = EventsPerSecond()
@@ -70,6 +79,9 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             self.recognizer = ArcFaceRecognizer(self.config, self.face_detector)
 
         self.recognizer.build()
+
+        # created on first use so enabling hires_from_record at runtime works
+        self.hires: HiResFaceFetcher | None = None
 
     CONFIG_UPDATE_TOPIC = "config/face_recognition"
 
@@ -170,6 +182,14 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 )
                 return
 
+            # the detector worked on the person crop, express the face in frame coordinates
+            face_box = (
+                face_box[0] + left,
+                face_box[1] + top,
+                face_box[2] + left,
+                face_box[3] + top,
+            )
+
         else:
             # don't run for object without attributes
             if not obj_data.get("current_attributes"):
@@ -213,6 +233,171 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             logger.debug(f"Empty face crop for {id}")
             return
 
+        if self.__queue_hires(obj_data, frame, face_box, face_frame):
+            return
+
+        self.__recognize_crop(camera, id, face_frame, start)
+
+    def __queue_hires(
+        self,
+        obj_data: dict[str, Any],
+        frame: np.ndarray,
+        face_box: tuple[int, int, int, int],
+        face_frame: np.ndarray,
+    ) -> bool:
+        """Hold a small face for the recording stream. True when it was queued."""
+        if not self.face_config.hires_from_record:
+            return False
+
+        face_px = min(face_box[2] - face_box[0], face_box[3] - face_box[1])
+
+        if face_px >= self.face_config.min_face_px_for_detect_crop:
+            return False
+
+        camera = obj_data["camera"]
+        person_box = obj_data.get("box")
+        frame_time = obj_data.get("frame_time")
+
+        if not person_box or frame_time is None:
+            return False
+
+        if not camera_records_main_stream(self.config.cameras[camera]):
+            if camera not in self.hires_skipped_cameras:
+                self.hires_skipped_cameras.add(camera)
+                logger.debug(
+                    f"{camera} does not record its main stream, small faces are recognized from the detect crop"
+                )
+
+            return False
+
+        fetcher = self.__get_hires()
+        detect_shape = (frame.shape[0] * 2 // 3, frame.shape[1])
+        queued = fetcher.add(
+            obj_data["id"],
+            camera,
+            frame_time,
+            tuple(person_box),
+            face_box,
+            detect_shape,
+            face_frame,
+        )
+
+        if queued:
+            logger.debug(
+                f"Face for {obj_data['id']} is {face_px}px on the detect stream, waiting for the recording to recognize it"
+            )
+        else:
+            logger.debug(
+                f"Not queuing {face_px}px face for {obj_data['id']} for the recording stream"
+            )
+
+        # either way the detect crop is not recognized now: when queued the
+        # recording result (or its fallback) will be, when not queued a larger
+        # candidate for this object already is
+        return camera not in fetcher.no_gain_cameras
+
+    def __get_hires(self) -> HiResFaceFetcher:
+        if self.hires is None:
+            self.hires = HiResFaceFetcher(
+                self.config.ffmpeg.ffmpeg_path,
+                lambda camera: hwaccel_args_for(self.config.cameras[camera]),
+            )
+
+        return self.hires
+
+    def drain_results(self) -> list[dict[str, Any]]:
+        """Finish faces whose recording segment has arrived.
+
+        The maintainer calls this once per loop. Recognition happens here on
+        the maintainer thread, the same thread process_frame runs on, so the
+        detector and recognizer are never used concurrently.
+        """
+        if self.hires is not None:
+            for outcome in self.hires.poll():
+                self.__finish_hires(outcome)
+
+            for object_id in list(self.pending_expirations):
+                if self.hires.pending_count(object_id) == 0:
+                    self.__drop_history(
+                        object_id, self.pending_expirations.pop(object_id)
+                    )
+
+        return []
+
+    def shutdown(self) -> None:
+        if self.hires is not None:
+            self.hires.shutdown()
+
+    def __finish_hires(self, outcome: HiResOutcome) -> None:
+        candidate = outcome.candidate
+        start = datetime.datetime.now().timestamp()
+        detect_px = candidate.detect_face_px
+
+        if outcome.region is None:
+            logger.debug(
+                f"Recording frame for {candidate.object_id} unavailable ({outcome.reason}), recognizing the {detect_px}px detect crop"
+            )
+            self.__recognize_crop(
+                candidate.camera, candidate.object_id, candidate.detect_crop, start
+            )
+            return
+
+        detection = self.face_detector.detect(
+            outcome.region, self.face_config.detection_threshold
+        )
+
+        if detection is None:
+            logger.debug(
+                f"No face in the recording frame region for {candidate.object_id}, recognizing the {detect_px}px detect crop"
+            )
+            self.__recognize_crop(
+                candidate.camera, candidate.object_id, candidate.detect_crop, start
+            )
+            return
+
+        ox, oy = outcome.region_origin
+        face_box = (
+            detection.face[0] + ox,
+            detection.face[1] + oy,
+            detection.face[2] + ox,
+            detection.face[3] + oy,
+        )
+        sx, sy = outcome.scale
+        person_box = (
+            int(candidate.person_box[0] * sx),
+            int(candidate.person_box[1] * sy),
+            int(candidate.person_box[2] * sx),
+            int(candidate.person_box[3] * sy),
+        )
+
+        if not box_center_within(face_box, person_box):
+            logger.debug(
+                f"Face in the recording frame for {candidate.object_id} is outside the person box, recognizing the {detect_px}px detect crop"
+            )
+            self.__recognize_crop(
+                candidate.camera, candidate.object_id, candidate.detect_crop, start
+            )
+            return
+
+        face_frame = outcome.region[
+            detection.face[1] : detection.face[3], detection.face[0] : detection.face[2]
+        ]
+
+        if face_frame.size == 0:
+            self.__recognize_crop(
+                candidate.camera, candidate.object_id, candidate.detect_crop, start
+            )
+            return
+
+        logger.debug(
+            f"Recognizing {candidate.object_id} from the recording: face is {face_frame.shape[1]}x{face_frame.shape[0]}px, was {candidate.detect_crop.shape[1]}x{candidate.detect_crop.shape[0]}px on the detect stream"
+        )
+        self.__recognize_crop(candidate.camera, candidate.object_id, face_frame, start)
+
+    def __recognize_crop(
+        self, camera: str, id: str, face_frame: np.ndarray, start: float
+    ) -> None:
+        """Run recognition on a face crop and apply the result to the object."""
         res = self.recognizer.classify(face_frame)
 
         if not res:
@@ -405,6 +590,15 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         return None
 
     def expire_object(self, object_id: str, camera: str) -> None:
+        if self.hires is not None and not self.hires.expire(object_id):
+            # faces are still waiting for their recording, the result will be
+            # applied to the finished event and the history dropped then
+            self.pending_expirations[object_id] = camera
+            return
+
+        self.__drop_history(object_id, camera)
+
+    def __drop_history(self, object_id: str, camera: str) -> None:
         if object_id in self.person_face_history:
             self.person_face_history.pop(object_id)
 

@@ -341,6 +341,17 @@ class FaceRecognitionConfig(FrigateBaseModel):
         title="Device",
         description="This is an override, to target a specific device. See https://onnxruntime.ai/docs/execution-providers/ for more information",
     )
+    hires_from_record: bool = Field(
+        default=False,
+        title="Recognize small faces from the recording stream",
+        description="When a face found on the detect stream is smaller than min_face_px_for_detect_crop, wait for the recording segment that contains the frame, decode one frame from the camera's record stream, re-detect the face inside the person's box at full resolution and recognize that crop instead. Adds latency (recordings are written in segments) and one short ffmpeg decode per face. Cameras without recording fall back to the detect crop.",
+    )
+    min_face_px_for_detect_crop: int = Field(
+        default=80,
+        ge=0,
+        title="Minimum face size for the detect crop",
+        description="Faces whose shorter side on the detect stream is at least this many pixels are recognized directly from the detect frame. Smaller faces use the recording stream when hires_from_record is enabled.",
+    )
 
 
 class CameraFaceRecognitionConfig(FrigateBaseModel):
